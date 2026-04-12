@@ -17,7 +17,7 @@ In the SRS benchmark, we use a tool called `TimeSeriesSplit`. This is part of th
 
 ### Metrics
 
-We use three metrics in the time benchmark to evaluate how well these methods perform: [RMSE](https://en.wikipedia.org/wiki/Root_mean_square_deviation), [MAE](https://en.wikipedia.org/wiki/Mean_absolute_error) and [MAPE](https://en.wikipedia.org/wiki/Mean_absolute_percentage_error).
+We use three metrics in the time benchmark to evaluate how well these methods perform: [RMSE](https://en.wikipedia.org/wiki/Root_mean_square_deviation), [MAE](https://en.wikipedia.org/wiki/Mean_absolute_error) and [MAPE](https://en.wikipedia.org/wiki/Mean_absolute_percentage_error). For all three metrics lower values are better.
 
 ### Methods
 
@@ -36,5 +36,7 @@ Total number of collections (each from one Anki user): 10,000.
 Total number of reviews for evaluation: _________.
 
 Due to Anki's feature ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) capping review time, capped reviews are excluded. Additionally, reviews that took >30 minutes are excluded, though they are a small minority of all reviews.
+
+The best result for each metric is highlighted in **bold**.
 
 (table will be here)
