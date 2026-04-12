@@ -16,9 +16,10 @@ Supported methods (select via --method):
 
 Notes:
 - duration in parquet is milliseconds, converted to seconds with 3 decimals.
-- censored durations are excluded from BOTH train and test by iteratively finding the mode
-and removing all values equal to if if that mode has .000 seconds (i.e., ms % 1000 == 0)
-- zero/non-positive duration rows are dropped.
+- censored durations are excluded from train/test evaluation targets by iteratively
+  finding the mode and removing it when it is exactly xxx.000 seconds (ms % 1000 == 0).
+- zero/non-positive duration rows are dropped from evaluation targets.
+- FSRS feature generation/training uses unfiltered-by-duration review history.
 """
 
 from __future__ import annotations
@@ -152,20 +153,18 @@ def _drop_iterative_capped_modes(df: pd.DataFrame, duration_col: str = "duration
 
         top_freq = int(vc.iloc[0])
         if top_freq <= 1:
-            # No repeated value left -> no meaningful "capped mode" to remove
             break
 
-        # Deterministic tie-break if multiple modes: pick smallest value
         mode_candidates = vc[vc == top_freq].index.to_numpy(dtype="int64")
         mode_val = int(np.min(mode_candidates))
 
-        # ".000 seconds" <=> integer milliseconds divisible by 1000
         if mode_val % 1000 != 0:
             break
 
         out = out[out[duration_col] != mode_val].copy()
 
     return out
+
 
 def _is_inadequate_exception(e: Exception) -> bool:
     s = str(e).lower()
@@ -176,12 +175,51 @@ def _is_inadequate_exception(e: Exception) -> bool:
         or "empty" in s and "batch" in s
     )
 
+
+def _build_partition_map(raw_base: pd.DataFrame, user_id: int, config: Config) -> pd.DataFrame:
+    out = raw_base[["event_id"]].copy()
+
+    if config.partitions == "none":
+        out["partition"] = 0
+        return out
+
+    # Build with minimal columns to avoid duplicate-name issues in feature pipeline.
+    card_cols = ["card_id", "deck_id"]
+    df_cards = pd.read_parquet(
+        config.data_path / "cards",
+        filters=[("user_id", "=", user_id)],
+        columns=["user_id", *card_cols],
+    ).drop(columns=["user_id"], errors="ignore")
+
+    tmp = raw_base[["event_id", "card_id"]].merge(
+        df_cards.drop_duplicates("card_id"),
+        on="card_id",
+        how="left",
+    )
+
+    if config.partitions == "deck":
+        tmp["partition"] = tmp["deck_id"].fillna(-1).astype(int)
+    else:
+        df_decks = pd.read_parquet(
+            config.data_path / "decks",
+            filters=[("user_id", "=", user_id)],
+            columns=["user_id", "deck_id", "preset_id"],
+        ).drop(columns=["user_id"], errors="ignore")
+        tmp = tmp.merge(
+            df_decks.drop_duplicates("deck_id"),
+            on="deck_id",
+            how="left",
+        )
+        tmp["partition"] = tmp["preset_id"].fillna(-1).astype(int)
+
+    return tmp[["event_id", "partition"]]
+
+
 def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
-      eval_df: rows used for benchmarking (includes first reviews)
-      algorithm_df: feature-engineered rows for FSRS-7 (non-first target rows, with tensors)
-    Both derive from the same filtered raw data to ensure censor exclusion everywhere.
+      eval_df: rows used for benchmarking (includes first reviews), duration-filtered.
+      algorithm_df: feature-engineered rows for FSRS-7, built from unfiltered durations.
     """
     raw = pd.read_parquet(config.data_path / "revlogs" / f"user_id={user_id}").copy()
 
@@ -198,44 +236,34 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     raw["first_review"] = raw["i_raw"] == 1
     raw = raw[raw["i_raw"] <= config.max_seq_len * 2].copy()
 
-    raw["duration"] = pd.to_numeric(raw["duration"], errors="coerce")
-    raw = raw.dropna(subset=["duration"]).copy()
-    raw["duration"] = raw["duration"].astype("int64")
+    # Shared base after structural filtering; keep duration unfiltered for FSRS path.
+    raw_base = raw.sort_values("event_id").copy()
 
-    non_positive = raw["duration"] <= 0
-    afk_too_long = raw["duration"] > 1_800_000  # > 30 min in ms
-    raw = raw[~non_positive & ~afk_too_long].copy()
+    # Partition map (by event_id) computed separately to avoid introducing duplicate columns.
+    partition_map = _build_partition_map(raw_base, user_id, config)
 
-    # Iteratively remove repeated modal values that are exact xxx.000 seconds
-    raw = _drop_iterative_capped_modes(raw, duration_col="duration")
-
-    raw["duration_sec"] = (raw["duration"] / 1000.0).round(3)
-    raw = raw.sort_values("event_id").copy()
-
-    if config.partitions != "none":
-        df_cards = pd.read_parquet(config.data_path / "cards", filters=[("user_id", "=", user_id)])
-        df_cards.drop(columns=["user_id"], inplace=True)
-        df_decks = pd.read_parquet(config.data_path / "decks", filters=[("user_id", "=", user_id)])
-        df_decks.drop(columns=["user_id"], inplace=True)
-        raw = raw.merge(df_cards, on="card_id", how="left").merge(df_decks, on="deck_id", how="left")
-        raw.fillna(-1, inplace=True)
-        if config.partitions == "preset":
-            raw["partition"] = raw["preset_id"].astype(int)
-        else:
-            raw["partition"] = raw["deck_id"].astype(int)
-    else:
-        raw["partition"] = 0
-
-    eval_df = raw.copy()
-
-    algorithm_input = raw.copy()
+    # FSRS path: unfiltered-by-duration history.
+    algorithm_input = raw_base.copy()
     algorithm_df = create_features(algorithm_input, config)
+    algorithm_df = algorithm_df.merge(partition_map, on="event_id", how="left")
+    algorithm_df["partition"] = algorithm_df["partition"].fillna(-1).astype(int)
 
-    keep_cols = ["event_id", "partition", "duration_sec", "first_review", "rating", "elapsed_days"]
-    algorithm_df = algorithm_df.merge(eval_df[keep_cols], on="event_id", how="left", suffixes=("", "_eval"))
-    if "partition_eval" in algorithm_df.columns:
-        algorithm_df["partition"] = algorithm_df["partition_eval"].astype(int)
-        algorithm_df.drop(columns=["partition_eval"], inplace=True)
+    # Time-target path: duration filtering for regression evaluation.
+    eval_df = raw_base.copy()
+    eval_df["duration"] = pd.to_numeric(eval_df["duration"], errors="coerce")
+    eval_df = eval_df.dropna(subset=["duration"]).copy()
+    eval_df["duration"] = eval_df["duration"].astype("int64")
+
+    non_positive = eval_df["duration"] <= 0
+    afk_too_long = eval_df["duration"] > 1_800_000  # > 30 min in ms
+    eval_df = eval_df[~non_positive & ~afk_too_long].copy()
+
+    eval_df = _drop_iterative_capped_modes(eval_df, duration_col="duration")
+
+    eval_df["duration_sec"] = (eval_df["duration"] / 1000.0).round(3)
+    eval_df = eval_df.merge(partition_map, on="event_id", how="left")
+    eval_df["partition"] = eval_df["partition"].fillna(-1).astype(int)
+    eval_df = eval_df.sort_values("event_id").copy()
 
     if eval_df.shape[0] < 6:
         raise Exception(f"{user_id} does not have enough usable (non-censored) data.")
@@ -304,8 +332,6 @@ class AlgorithmTrainer:
                 self.optimizer.zero_grad()
                 seq_lens = batch[3]
                 if seq_lens.shape[0] == 0 or torch.max(seq_lens).item() <= 0:
-                    continue
-                if torch.max(seq_lens).item() <= 0:
                     continue
                 result = self._batch_process(batch)
                 loss = (
@@ -391,7 +417,7 @@ def _fill_grade_medians(base: dict[int, float], fallback: float) -> dict[int, fl
 
 
 def _predict_const7(test_df: pd.DataFrame) -> np.ndarray:
-    return np.full(len(test_df), 7.0, dtype=float)  # 7 seconds
+    return np.full(len(test_df), 7.0, dtype=float)
 
 
 def _predict_user_median(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
@@ -470,12 +496,6 @@ def _predict_R_maps(
     test_algorithm_df: pd.DataFrame,
     config: Config,
 ) -> tuple[dict[int, float], dict[int, float], dict[int, list]]:
-    """
-    Returns:
-      train_R_map[event_id] = R
-      test_R_map[event_id]  = R
-      partition_weights
-    """
     if len(train_algorithm_df) == 0:
         return {}, {}, {}
 
@@ -691,10 +711,15 @@ def process(user_id: int, config: Config) -> tuple[dict, Optional[dict]]:
         if len(test_eval) == 0 or len(train_eval) == 0:
             continue
 
-        train_ids = set(train_eval["event_id"].tolist())
-        test_ids = set(test_eval["event_id"].tolist())
-        train_algorithm_df = algorithm_df[algorithm_df["event_id"].isin(train_ids)].copy()
-        test_algorithm_df = algorithm_df[algorithm_df["event_id"].isin(test_ids)].copy()
+        # FSRS uses unfiltered-by-duration history, sliced by temporal event windows.
+        train_end = int(train_eval["event_id"].max())
+        test_start = int(test_eval["event_id"].min())
+        test_end = int(test_eval["event_id"].max())
+
+        train_algorithm_df = algorithm_df[algorithm_df["event_id"] <= train_end].copy()
+        test_algorithm_df = algorithm_df[
+            (algorithm_df["event_id"] >= test_start) & (algorithm_df["event_id"] <= test_end)
+        ].copy()
 
         if config.method == "const":
             pred = _predict_const7(test_eval)
