@@ -21,7 +21,7 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 
 ### Methods
 
-1) const: a hard-coded constant time. I chose 7 seconds.
+1) const: a hard-coded constant time. Currently, 7 seconds is used.
 2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One number per user.
 3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
 4) grade_median_8: median time for Again/Hard/Good/Easy, with the first review receiving special treatment and having its own values. 8 numbers per user.
