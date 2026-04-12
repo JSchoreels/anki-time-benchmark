@@ -3,7 +3,7 @@
 ## Introduction
 
 This benchmark reuses some of the code from the [SRS benchmark](https://github.com/open-spaced-repetition/srs-benchmark). However, it has a different goal: 
-instead of measuring how good spaced repetition algorithms are at predicting the probability of recall, it measures how well certain methods can predict the amount of time spent on a single review.
+instead of measuring how good spaced repetition algorithms are at predicting the probability of recall, it measures how well certain methods can predict the amount of time spent on a single review. This can be useful for improving Anki's simulator, or any spaced repetition simulator that is similar to Anki's.
 
 ## Dataset
 
