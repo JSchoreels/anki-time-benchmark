@@ -41,6 +41,7 @@ The best result for each metric is highlighted in **bold**.
 
 | Method | RMSE | MAE | MAPE |
 | --- | --- | --- | --- |
-| GRADE_MEDIAN_4 | **13.80±0.46 s** | **7.15±0.21 s** | **118%±15%** |
-| USER_MEDIAN | 14.03±0.47 s | 7.31±0.21 s | 123%±16% |
-| CONST | 14.64±0.47 s | 8.03±0.18 s | 158%±19% |
+| GRADE_MEDIAN_8 | **13.77±0.46 s** | **7.13±0.20 s** | **117%±15%** |
+| GRADE_MEDIAN_4 | 13.80±0.46 s | 7.15±0.20 s | 118%±15% |
+| USER_MEDIAN | 14.03±0.46 s | 7.31±0.21 s | 123%±17% |
+| CONST | 14.64±0.46 s | 8.03±0.18 s | 158%±21% |
