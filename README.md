@@ -24,19 +24,21 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 1) const: a hard-coded constant time. Currently, 7 seconds is used.
 2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One number per user.
 3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
-4) grade_median_8: median time for Again/Hard/Good/Easy, with the first review receiving special treatment and having its own values. 8 numbers per user.
+4) grade_median_8: median time for Again/Hard/Good/Easy, with the first review receiving special treatment and having its own values. 8 numbers per user. This method is currently used in Anki's simulator.
 5) fsrs_r_linear: first review -> first-grade median, else `t=b+a*R`. Here R is probability of recall predicted by FSRS-7.
 6) fsrs_r_grade_interact: first review -> first-grade median, else `t=a0+a1*g+a2*R+a3*g*R`, where G (grade) can be 1, 2, 3, 4. 
 
 
 ## Result
 
-Total number of collections (each from one Anki user): 10,000.
+Total number of collections (each from one Anki user): 9,9994.
 
-Total number of reviews for evaluation: _________.
+Total number of reviews for evaluation: 572,307,825.
 
-Due to Anki's feature ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) capping review time, capped reviews are excluded. Additionally, reviews that took >30 minutes are excluded, though they are a small minority of all reviews.
+Due to Anki's ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) setting capping review time, reviews with capped time are excluded. Additionally, reviews that took >30 minutes are excluded, though they are a small minority of all reviews. 6 users were excluded due to not having valid data after filtering.
 
 The best result for each metric is highlighted in **bold**.
 
-(table will be here)
+| Method | RMSE | MAE | MAPE |
+| --- | --- | --- | --- |
+| CONST | 14.64±0.46 s | 8.03±0.18 s | 158%±20% |
