@@ -41,4 +41,5 @@ The best result for each metric is highlighted in **bold**.
 
 | Method | RMSE | MAE | MAPE |
 | --- | --- | --- | --- |
+| USER_MEDIAN | **14.03±0.46 s** | **7.31±0.21 s** | **123%±18%** |
 | CONST | 14.64±0.46 s | 8.03±0.18 s | 158%±20% |
