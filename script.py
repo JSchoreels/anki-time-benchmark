@@ -54,6 +54,8 @@ from review_time_nn import (
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 
 METHOD_NAMES = {
     "const": "CONST",
@@ -124,6 +126,16 @@ class Config:
 
 
 def build_config(args: argparse.Namespace) -> Config:
+    project_root = Path(__file__).resolve().parent
+
+    data_path = Path(args.data)
+    if not data_path.is_absolute():
+        data_path = (project_root / data_path).resolve()
+
+    nn_ckpt_path = Path(args.nn_ckpt)
+    if not nn_ckpt_path.is_absolute():
+        nn_ckpt_path = (project_root / nn_ckpt_path).resolve()
+
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     return Config(
         data_path=Path(args.data),
@@ -1093,7 +1105,7 @@ def main() -> None:
                     if raw is not None:
                         raws.append(raw)
 
-    out_dir = Path("result")
+    out_dir = PROJECT_ROOT / "result"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stem = config.get_output_stem()
@@ -1132,6 +1144,9 @@ def main() -> None:
     if config.save_raw_output:
         print(f"raw_jsonl={raw_file}")
     print(f"errors_log={err_file}")
+
+    print(f"cwd={Path.cwd()}")
+    print(f"metrics_jsonl_abs={metrics_file.resolve()}")
 
 
 if __name__ == "__main__":
