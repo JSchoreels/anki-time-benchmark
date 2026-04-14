@@ -8,6 +8,17 @@ import numpy as np
 import scipy  # type: ignore
 
 
+DEFAULT_METHODS = [
+    "CONST",
+    "USER_MEDIAN",
+    "GRADE_MEDIAN_4",
+    "GRADE_MEDIAN_8",
+    "FSRS7_R_LINEAR",
+    "FSRS7_R_GRADE_INTERACT",
+    "FSRS7_DSR_GRADE_NN",
+]
+
+
 def sigdig(value: float, CI: float) -> Tuple[str, str]:
     def num_lead_zeros(x: float) -> float:
         return math.inf if x == 0 else -math.floor(math.log10(abs(x))) - 1
@@ -35,14 +46,14 @@ def confidence_interval(values: np.ndarray, weights: np.ndarray) -> float:
         for i, (v, w) in enumerate(zip(values, weights))
     }
 
-    def weighted_mean(z, axis):
+    def weighted_mean_bootstrap(z, axis):
         data = np.vectorize(dict_x_w.get)(z)
         return np.average(data[0], weights=data[1], axis=axis)
 
     try:
         ci_99 = scipy.stats.bootstrap(
             (identifiers,),
-            statistic=weighted_mean,
+            statistic=weighted_mean_bootstrap,
             confidence_level=0.99,
             axis=0,
             method="BCa",
@@ -59,11 +70,30 @@ def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
     return float(np.average(values, weights=weights))
 
 
-def discover_methods(result_dir: pathlib.Path) -> List[str]:
-    return [f.stem for f in sorted(result_dir.glob("*.jsonl"))]
+def discover_methods(result_dir: pathlib.Path, suffix: Optional[str]) -> List[str]:
+    stems = [f.stem for f in sorted(result_dir.glob("*.jsonl"))]
+    if suffix:
+        tag = f"_{suffix}"
+        methods = [s[:-len(tag)] for s in stems if s.endswith(tag)]
+        return sorted(set(methods))
+    return stems
 
 
-def load_method_user_metrics(method: str, result_dir: pathlib.Path) -> Dict[str, Dict]:
+def resolve_result_file(method: str, result_dir: pathlib.Path, suffix: Optional[str]) -> Optional[pathlib.Path]:
+    candidates: List[pathlib.Path] = []
+    if suffix:
+        candidates.append(result_dir / f"{method}_{suffix}.jsonl")
+    candidates.append(result_dir / f"{method}.jsonl")
+
+    for fp in candidates:
+        if fp.exists():
+            return fp
+    return None
+
+
+def load_method_user_metrics(
+    method: str, result_dir: pathlib.Path, suffix: Optional[str]
+) -> Dict[str, Dict]:
     """
     Returns per-user metrics for one method:
       {
@@ -71,8 +101,8 @@ def load_method_user_metrics(method: str, result_dir: pathlib.Path) -> Dict[str,
         ...
       }
     """
-    fp = result_dir / f"{method}.jsonl"
-    if not fp.exists():
+    fp = resolve_result_file(method, result_dir, suffix)
+    if fp is None:
         return {}
 
     with fp.open("r", encoding="utf-8") as f:
@@ -126,7 +156,11 @@ def fmt_mean_ci(mean: Optional[float], ci: Optional[float], suffix: str = "") ->
     if mean is None or ci is None:
         return "N/A"
     m, c = sigdig(mean, ci)
-    return f"{m}±{c}{suffix}"
+    if suffix == "s":
+        return f"{m}±{c} s"
+    if suffix == "%":
+        return f"{m}%±{c}%"
+    raise Exception("Unknown suffix")
 
 
 def main() -> None:
@@ -136,7 +170,24 @@ def main() -> None:
         "--methods",
         nargs="*",
         default=None,
-        help="Optional method names (file stems). If omitted, auto-discover from result dir",
+        help=(
+            "Optional base method names (e.g., CONST FSRS7_R_LINEAR). "
+            "If omitted, uses --default-methods or auto-discovery."
+        ),
+    )
+    parser.add_argument(
+        "--default-methods",
+        action="store_true",
+        help="Use built-in default method list instead of auto-discovery.",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="NO_FIRST_REVIEWS",
+        help=(
+            "Result filename suffix used by benchmark outputs, e.g. "
+            "NO_FIRST_REVIEWS or WITH_FIRST_REVIEWS. "
+            "Set empty string to disable suffix matching."
+        ),
     )
     parser.add_argument(
         "--weight-by",
@@ -151,15 +202,22 @@ def main() -> None:
         print(f"Result directory not found: {result_dir}")
         return
 
-    methods = args.methods if args.methods else discover_methods(result_dir)
+    suffix = args.suffix.strip() or None
+
+    if args.methods:
+        methods = args.methods
+    elif args.default_methods:
+        methods = DEFAULT_METHODS
+    else:
+        methods = discover_methods(result_dir, suffix=suffix)
+
     if not methods:
         print("No result files found.")
         return
 
-    # Load all method user maps first
     method_user_data: Dict[str, Dict[str, Dict]] = {}
     for method in methods:
-        d = load_method_user_metrics(method, result_dir)
+        d = load_method_user_metrics(method, result_dir, suffix=suffix)
         if d:
             method_user_data[method] = d
 
@@ -167,7 +225,6 @@ def main() -> None:
         print("No valid method files with MAE/RMSE/MAPE found.")
         return
 
-    # Intersection of users across all loaded method files
     user_sets: List[Set[str]] = [set(d.keys()) for d in method_user_data.values()]
     common_users = set.intersection(*user_sets) if user_sets else set()
 
@@ -175,11 +232,12 @@ def main() -> None:
         print("No common users found across selected method files.")
         return
 
+    suffix_label = suffix if suffix else "(none)"
+    print(f"Suffix: {suffix_label}")
     print(f"Aggregation weight: {args.weight_by} (99% CI, bootstrap BCa)")
     print(f"Methods compared: {len(method_user_data)}")
     print(f"Common users in all method files: {len(common_users)}")
 
-    # Print common review count once (using first method as reference)
     ref_method = next(iter(method_user_data.keys()))
     common_reviews = sum(method_user_data[ref_method][u]["size"] for u in common_users)
     print(f"Common reviews (from shared users): {common_reviews}\n")
@@ -195,14 +253,14 @@ def main() -> None:
         rows.append(
             (
                 method,
-                float("inf") if rmse_mean is None else rmse_mean,  # sort key
-                fmt_mean_ci(rmse_mean, rmse_ci, " s"),
-                fmt_mean_ci(mae_mean, mae_ci, " s"),
+                float("inf") if rmse_mean is None else rmse_mean,
+                fmt_mean_ci(rmse_mean, rmse_ci, "s"),
+                fmt_mean_ci(mae_mean, mae_ci, "s"),
                 fmt_mean_ci(mape_mean, mape_ci, "%"),
             )
         )
 
-    rows.sort(key=lambda x: x[1])  # lowest RMSE first
+    rows.sort(key=lambda x: x[1])
 
     print("| Method | RMSE | MAE | MAPE |")
     print("| --- | --- | --- | --- |")
