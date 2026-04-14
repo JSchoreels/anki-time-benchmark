@@ -24,7 +24,7 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 1) const: a hard-coded constant time. Currently, 7 seconds is used.
 2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One number per user.
 3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
-4) grade_median_4_4: same as above, but the previous grade also matters. For example, time for Again->Again is different than time for Again->Hard. 16 numbers per user.
+4) grade_median_4_4: same as above, but the previous grade also matters. For example, time for Again->Again is different from time for Again->Hard. 16 numbers per user.
 5) poor_mans_fsrs: `t=a0 + a1*ln(number of Agains) + a2*ln(total number of all reps) + a3*e^(-a4*interval length) + a5*G`. This is akin to using a very crude version of FSRS.
 6) fsrs_r_linear: `t=b + a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
 7) fsrs_r_grade_interact: `t=a0 + a1*G + a2*R + a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
