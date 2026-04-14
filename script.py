@@ -60,7 +60,7 @@ METHOD_NAMES = {
     "const": "CONST",
     "user_median": "USER_MEDIAN",
     "grade_median_4": "GRADE_MEDIAN_4",
-    "grade_median_8": "GRADE_MEDIAN_8",
+    "grade_median_8": "GRADE_MEDIAN_8",  # identical to GRADE_MEDIAN_4 when --with_first_reviews is false
     "fsrs_r_linear": "FSRS7_R_LINEAR",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
@@ -408,22 +408,41 @@ def _fill_grade_medians(base: dict[int, float], fallback: float) -> dict[int, fl
     return {g: float(base.get(g, fallback)) for g in [1, 2, 3, 4]}
 
 
+def _duration_training_scope(train_df: pd.DataFrame, with_first_reviews: bool) -> pd.DataFrame:
+    """
+    Keep training statistics conceptually aligned with evaluation policy:
+    - with_first_reviews=True  -> use all training rows
+    - with_first_reviews=False -> use non-first rows only (fallback to all if empty)
+    """
+    if with_first_reviews:
+        return train_df
+    non_first = train_df[~train_df["first_review"]].copy()
+    return non_first if len(non_first) > 0 else train_df
+
+
 def _predict_const7(test_df: pd.DataFrame) -> np.ndarray:
     return np.full(len(test_df), 7.0, dtype=float)
 
 
-def _predict_user_median(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
-    med = float(train_df["duration_sec"].median())
+def _predict_user_median(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
+    src = _duration_training_scope(train_df, with_first_reviews=with_first_reviews)
+    med = float(src["duration_sec"].median())
     return np.full(len(test_df), med, dtype=float)
 
 
-def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
-    global_med = float(train_df["duration_sec"].median())
-    med = _fill_grade_medians(_median_by_grade(train_df), global_med)
+def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
+    src = _duration_training_scope(train_df, with_first_reviews=with_first_reviews)
+    global_med = float(src["duration_sec"].median())
+    med = _fill_grade_medians(_median_by_grade(src), global_med)
     return test_df["rating"].map(med).astype(float).to_numpy()
 
 
-def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
+def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
+    # Required equivalence:
+    # When first reviews are excluded from evaluation, force exact behavioral parity with grade_median_4.
+    if not with_first_reviews:
+        return _predict_grade_median_4(train_df, test_df, with_first_reviews=False)
+
     global_med = float(train_df["duration_sec"].median())
     by_grade_all = _fill_grade_medians(_median_by_grade(train_df), global_med)
 
@@ -549,9 +568,11 @@ def _predict_fsrs_r_linear(
     test_eval: pd.DataFrame,
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
+    with_first_reviews: bool,
 ) -> np.ndarray:
-    global_med = float(train_eval["duration_sec"].median())
-    by_grade_all = _fill_grade_medians(_median_by_grade(train_eval), global_med)
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
 
     first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
     first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
@@ -567,7 +588,7 @@ def _predict_fsrs_r_linear(
     else:
         a, b = 0.0, global_med
 
-    non_first_map_raw = train_eval[~train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
     non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
 
     pred = []
@@ -587,9 +608,11 @@ def _predict_fsrs_r_grade_interact(
     test_eval: pd.DataFrame,
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
+    with_first_reviews: bool,
 ) -> np.ndarray:
-    global_med = float(train_eval["duration_sec"].median())
-    by_grade_all = _fill_grade_medians(_median_by_grade(train_eval), global_med)
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
 
     first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
     first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
@@ -607,7 +630,7 @@ def _predict_fsrs_r_grade_interact(
     else:
         a0, a1, a2, a3 = global_med, 0.0, 0.0, 0.0
 
-    non_first_map_raw = train_eval[~train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
     non_first_map = {g_: float(non_first_map_raw.get(g_, by_grade_all[g_])) for g_ in [1, 2, 3, 4]}
 
     pred = []
@@ -742,9 +765,11 @@ def _predict_fsrs_dsr_grade_nn(
     test_dsr_map: dict[int, tuple[float, float, float]],
     nn_state: dict,
     config: Config,
+    with_first_reviews: bool,
 ) -> np.ndarray:
-    global_med = float(train_eval["duration_sec"].median())
-    by_grade_all = _fill_grade_medians(_median_by_grade(train_eval), global_med)
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
 
     first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
     first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
@@ -835,7 +860,7 @@ def evaluate(
         "size": int(len(y_true)),
     }
 
-    if algorithm_weights_last_split:
+    if config.save_weights and algorithm_weights_last_split:
         stats["algorithm_parameters"] = {
             int(partition): list(map(lambda x: round(float(x), 6), w))
             for partition, w in algorithm_weights_last_split.items()
@@ -921,21 +946,33 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
             pred = _predict_const7(test_eval)
 
         elif config.method == "user_median":
-            pred = _predict_user_median(train_eval, test_eval)
+            pred = _predict_user_median(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
 
         elif config.method == "grade_median_4":
-            pred = _predict_grade_median_4(train_eval, test_eval)
+            pred = _predict_grade_median_4(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
 
         elif config.method == "grade_median_8":
-            pred = _predict_grade_median_8(train_eval, test_eval)
+            pred = _predict_grade_median_8(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
 
         elif config.method in ("fsrs_r_linear", "fsrs_r_grade_interact"):
             train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
             last_algorithm_weights = weights if weights else last_algorithm_weights
             if config.method == "fsrs_r_linear":
-                pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
+                pred = _predict_fsrs_r_linear(
+                    train_eval,
+                    test_eval,
+                    train_R_map,
+                    test_R_map,
+                    with_first_reviews=config.with_first_reviews,
+                )
             else:
-                pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
+                pred = _predict_fsrs_r_grade_interact(
+                    train_eval,
+                    test_eval,
+                    train_R_map,
+                    test_R_map,
+                    with_first_reviews=config.with_first_reviews,
+                )
 
         elif config.method == "fsrs_dsr_grade_nn":
             if nn_state is None:
@@ -948,6 +985,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                 test_dsr_map=test_dsr_map,
                 nn_state=nn_state,
                 config=config,
+                with_first_reviews=config.with_first_reviews,
             )
 
         else:
