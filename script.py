@@ -10,6 +10,7 @@ Methods:
 - fsrs_r_linear
 - fsrs_r_grade_interact
 - fsrs_dsr_grade_nn
+- poor_mans_fsrs
 
 Behavior for fsrs_dsr_grade_nn:
 1) Pretrain once and save .pth checkpoint if it does not exist.
@@ -17,7 +18,7 @@ Behavior for fsrs_dsr_grade_nn:
 3) Then run per-user fine-tuning/evaluation.
 
 Usage example:
-python script.py --method fsrs_dsr_grade_nn --processes 1
+python script.py --method grade_median_4 --processes 1
 """
 
 from __future__ import annotations
@@ -53,6 +54,11 @@ from review_time_nn import (
     predict_seconds,
 )
 
+try:
+    from scipy.optimize import curve_fit  # type: ignore
+except Exception:
+    curve_fit = None
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -61,11 +67,12 @@ METHOD_NAMES = {
     "const": "CONST",
     "user_median": "USER_MEDIAN",
     "grade_median_4": "GRADE_MEDIAN_4",
-    "grade_median_4_4": "GRADE_MEDIAN_4_4",  # never counts first reviews toward MAE/RMSE/MAPE, regardless of the --with_first_reviews flag
+    "grade_median_4_4": "GRADE_MEDIAN_4_4",
     "grade_median_8": "GRADE_MEDIAN_8",  # identical to GRADE_MEDIAN_4 when --with_first_reviews is false
     "fsrs_r_linear": "FSRS7_R_LINEAR",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
+    "poor_mans_fsrs": "POOR_MANS_FSRS",
 }
 
 
@@ -196,6 +203,12 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     raw["prev_rating"] = raw.groupby("card_id")["rating"].shift(1)
     raw["i_raw"] = raw.groupby("card_id").cumcount() + 1
     raw["first_review"] = raw["i_raw"] == 1
+
+    is_again = (raw["rating"] == 1).astype(int)
+    raw["again_count_before"] = is_again.groupby(raw["card_id"]).cumsum() - is_again
+    raw["again_count_before"] = raw["again_count_before"].astype(int)
+    raw["total_reps_before"] = raw.groupby("card_id").cumcount().astype(int)
+
     raw = raw[raw["i_raw"] <= config.max_seq_len * 2].copy()
 
     raw_base = raw.sort_values("event_id").copy()
@@ -217,6 +230,36 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     )
 
     eval_df["duration_sec"] = (eval_df["duration"] / 1000.0).round(3)
+
+    eval_df["interval_days"] = np.nan
+
+    # Try interval from raw columns first
+    raw_interval_candidates = [
+        "delta_t",
+        "elapsed_days",
+        "elapsed",
+        "interval",
+        "ivl",
+    ]
+    for c in raw_interval_candidates:
+        if c in eval_df.columns:
+            eval_df["interval_days"] = pd.to_numeric(eval_df[c], errors="coerce")
+            break
+
+    # Fill/override with algorithm delta_t when available (usually the best source for interval)
+    if "delta_t" in algorithm_df.columns and "event_id" in algorithm_df.columns:
+        dt_map = dict(
+            zip(
+                algorithm_df["event_id"].astype(int).tolist(),
+                pd.to_numeric(algorithm_df["delta_t"], errors="coerce").tolist(),
+            )
+        )
+        mapped = eval_df["event_id"].map(dt_map)
+        eval_df["interval_days"] = eval_df["interval_days"].where(eval_df["interval_days"].notna(), mapped)
+
+    eval_df["interval_days"] = pd.to_numeric(eval_df["interval_days"], errors="coerce")
+    eval_df["interval_days"] = eval_df["interval_days"].clip(lower=0)
+
     eval_df = eval_df.sort_values("event_id").copy()
 
     if len(eval_df) < 6:
@@ -393,7 +436,7 @@ def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_
     return test_df["rating"].map(med).astype(float).to_numpy()
 
 
-def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
+def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
     """Predict by (prev_rating, current_rating) pair — 16 bins.
 
     Training scope: rows that have a prev_rating (i.e. not first reviews).
@@ -403,7 +446,6 @@ def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame, wit
     """
     src = train_df[train_df["prev_rating"].notna()].copy()
     if len(src) == 0:
-        # Nothing to learn from — fall back to global median of all training rows
         fallback = float(train_df["duration_sec"].median())
         return np.full(len(test_df), fallback, dtype=float)
 
@@ -422,9 +464,7 @@ def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame, wit
                 test_df.loc[has_prev, "rating"].astype(int).to_numpy(),
             )
         )
-        pred_vals = np.array(
-            [float(pair_median.get(k, global_med)) for k in keys], dtype=float
-        )
+        pred_vals = np.array([float(pair_median.get(k, global_med)) for k in keys], dtype=float)
         pred[has_prev] = pred_vals
     return pred
 
@@ -455,6 +495,107 @@ def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame, with_
 def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
     return coef
+
+
+def _poor_mans_fsrs_model(
+    xdata: np.ndarray,
+    a0: float,
+    a1: float,
+    a2: float,
+    a3: float,
+    a4: float,
+    a5: float,
+) -> np.ndarray:
+    # xdata rows: [ln_agains, ln_total_reps, interval_days, grade]
+    ln_agains = xdata[0]
+    ln_total = xdata[1]
+    interval = np.maximum(xdata[2], 0.0)
+    grade = xdata[3]
+    return a0 + a1 * ln_agains + a2 * ln_total + a3 * np.exp(-a4 * interval) + a5 * grade
+
+
+def _predict_poor_mans_fsrs(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    with_first_reviews: bool,
+) -> np.ndarray:
+    # Fallback baseline
+    fallback = _predict_grade_median_4(train_df, test_df, with_first_reviews=with_first_reviews)
+    if curve_fit is None:
+        return fallback
+
+    src = _duration_training_scope(train_df, with_first_reviews=with_first_reviews).copy()
+    if len(src) < 12:
+        return fallback
+
+    if "again_count_before" not in src.columns or "total_reps_before" not in src.columns or "interval_days" not in src.columns:
+        return fallback
+
+    src["again_count_before"] = pd.to_numeric(src["again_count_before"], errors="coerce")
+    src["total_reps_before"] = pd.to_numeric(src["total_reps_before"], errors="coerce")
+    src["interval_days"] = pd.to_numeric(src["interval_days"], errors="coerce")
+    src["rating"] = pd.to_numeric(src["rating"], errors="coerce")
+    src["duration_sec"] = pd.to_numeric(src["duration_sec"], errors="coerce")
+
+    src = src.dropna(subset=["again_count_before", "total_reps_before", "rating", "duration_sec"]).copy()
+    if len(src) < 12:
+        return fallback
+
+    if src["interval_days"].notna().any():
+        interval_fill = float(np.nanmedian(src["interval_days"].to_numpy(dtype=float)))
+    else:
+        interval_fill = 0.0
+    if not np.isfinite(interval_fill):
+        interval_fill = 0.0
+
+    src["interval_days"] = src["interval_days"].fillna(interval_fill).clip(lower=0)
+
+    ln_agains = np.log1p(np.clip(src["again_count_before"].to_numpy(dtype=float), 0, None))
+    ln_total = np.log1p(np.clip(src["total_reps_before"].to_numpy(dtype=float), 0, None))
+    interval = src["interval_days"].to_numpy(dtype=float)
+    grade = src["rating"].to_numpy(dtype=float)
+    y = src["duration_sec"].to_numpy(dtype=float)
+
+    xdata = np.vstack([ln_agains, ln_total, interval, grade])
+
+    y_med = float(np.median(y))
+    y_std = float(np.std(y)) if len(y) > 1 else 1.0
+
+    p0 = np.array([y_med, 0.5, -0.5, max(0.1, y_std), 0.1, 0.5], dtype=float)
+    lower = np.array([-np.inf, -np.inf, -np.inf, -np.inf, 1e-8, -np.inf], dtype=float)  # enforce a4 > 0
+    upper = np.array([np.inf, np.inf, np.inf, np.inf, np.inf, np.inf], dtype=float)
+
+    try:
+        params, _ = curve_fit(
+            _poor_mans_fsrs_model,
+            xdata,
+            y,
+            p0=p0,
+            bounds=(lower, upper),
+            maxfev=20000,
+        )
+    except Exception:
+        return fallback
+
+    test_tmp = test_df.copy()
+    if "again_count_before" not in test_tmp.columns or "total_reps_before" not in test_tmp.columns or "interval_days" not in test_tmp.columns:
+        return fallback
+
+    test_tmp["again_count_before"] = pd.to_numeric(test_tmp["again_count_before"], errors="coerce").fillna(0).clip(lower=0)
+    test_tmp["total_reps_before"] = pd.to_numeric(test_tmp["total_reps_before"], errors="coerce").fillna(0).clip(lower=0)
+    test_tmp["interval_days"] = pd.to_numeric(test_tmp["interval_days"], errors="coerce").fillna(interval_fill).clip(lower=0)
+    test_tmp["rating"] = pd.to_numeric(test_tmp["rating"], errors="coerce").fillna(3.0)
+
+    x_test = np.vstack(
+        [
+            np.log1p(test_tmp["again_count_before"].to_numpy(dtype=float)),
+            np.log1p(test_tmp["total_reps_before"].to_numpy(dtype=float)),
+            test_tmp["interval_days"].to_numpy(dtype=float),
+            test_tmp["rating"].to_numpy(dtype=float),
+        ]
+    )
+    pred = _poor_mans_fsrs_model(x_test, *params)
+    return pred.astype(float)
 
 
 def _fit_algorithm_weights(train_algorithm_df: pd.DataFrame, config: Config) -> list:
@@ -888,8 +1029,6 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
     save_tmp: list[pd.DataFrame] = []
     last_algorithm_weights: Optional[list] = None
 
-    # grade_median_4_4 always excludes first reviews from metrics,
-    # regardless of the with_first_reviews flag.
     method_always_excludes_first = config.method == "grade_median_4_4"
 
     for _, (train_idx, test_idx) in enumerate(tscv.split(eval_df)):
@@ -906,13 +1045,9 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         if not config.with_first_reviews and (~train_eval["first_review"]).sum() == 0:
             continue
 
-        # Keep FSRS memory state consistent:
-        # train on all algorithm events strictly before first test event,
-        # so filtered eval gaps do not erase history.
         first_test_event = int(test_eval["event_id"].min())
         train_algorithm_df = algorithm_df[algorithm_df["event_id"] < first_test_event].copy()
 
-        # Predict only on algorithm rows that correspond to actual test_eval events.
         test_event_ids = set(test_eval["event_id"].tolist())
         test_algorithm_df = algorithm_df[algorithm_df["event_id"].isin(test_event_ids)].copy()
 
@@ -930,6 +1065,13 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
 
         elif config.method == "grade_median_8":
             pred = _predict_grade_median_8(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
+
+        elif config.method == "poor_mans_fsrs":
+            pred = _predict_poor_mans_fsrs(
+                train_df=train_eval,
+                test_df=test_eval,
+                with_first_reviews=config.with_first_reviews,
+            )
 
         elif config.method in ("fsrs_r_linear", "fsrs_r_grade_interact"):
             train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
@@ -973,7 +1115,6 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         out_df["t_true"] = out_df["duration_sec"].astype(float)
         out_df["t_pred"] = pred.astype(float)
 
-        # Determine which rows count for metrics
         if method_always_excludes_first:
             out_df["used_for_metrics"] = ~out_df["first_review"]
             metric_df = out_df[~out_df["first_review"]].copy()
@@ -1018,6 +1159,7 @@ def _parse_args() -> argparse.Namespace:
             "grade_median_4",
             "grade_median_4_4",
             "grade_median_8",
+            "poor_mans_fsrs",
             "fsrs_r_linear",
             "fsrs_r_grade_interact",
             "fsrs_dsr_grade_nn",
