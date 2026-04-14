@@ -5,6 +5,7 @@ Methods:
 - const
 - user_median
 - grade_median_4
+- grade_median_4_4
 - grade_median_8
 - fsrs_r_linear
 - fsrs_r_grade_interact
@@ -60,6 +61,7 @@ METHOD_NAMES = {
     "const": "CONST",
     "user_median": "USER_MEDIAN",
     "grade_median_4": "GRADE_MEDIAN_4",
+    "grade_median_4_4": "GRADE_MEDIAN_4_4",  # never counts first reviews toward MAE/RMSE/MAPE, regardless of the --with_first_reviews flag
     "grade_median_8": "GRADE_MEDIAN_8",  # identical to GRADE_MEDIAN_4 when --with_first_reviews is false
     "fsrs_r_linear": "FSRS7_R_LINEAR",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
@@ -191,6 +193,7 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     raw["event_id"] = np.arange(1, len(raw) + 1)
 
     raw = raw.sort_values(by=["card_id", "event_id"]).copy()
+    raw["prev_rating"] = raw.groupby("card_id")["rating"].shift(1)
     raw["i_raw"] = raw.groupby("card_id").cumcount() + 1
     raw["first_review"] = raw["i_raw"] == 1
     raw = raw[raw["i_raw"] <= config.max_seq_len * 2].copy()
@@ -388,6 +391,42 @@ def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_
     global_med = float(src["duration_sec"].median())
     med = _fill_grade_medians(_median_by_grade(src), global_med)
     return test_df["rating"].map(med).astype(float).to_numpy()
+
+
+def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
+    """Predict by (prev_rating, current_rating) pair — 16 bins.
+
+    Training scope: rows that have a prev_rating (i.e. not first reviews).
+    Fallback for missing pairs: global median across those same rows.
+    First reviews in test get the global median (they are excluded from
+    metrics anyway).
+    """
+    src = train_df[train_df["prev_rating"].notna()].copy()
+    if len(src) == 0:
+        # Nothing to learn from — fall back to global median of all training rows
+        fallback = float(train_df["duration_sec"].median())
+        return np.full(len(test_df), fallback, dtype=float)
+
+    src["prev_rating"] = src["prev_rating"].astype(int)
+    src["rating"] = src["rating"].astype(int)
+
+    global_med = float(src["duration_sec"].median())
+    pair_median = src.groupby(["prev_rating", "rating"])["duration_sec"].median()
+
+    pred = np.full(len(test_df), global_med, dtype=float)
+    has_prev = test_df["prev_rating"].notna().to_numpy()
+    if has_prev.any():
+        keys = list(
+            zip(
+                test_df.loc[has_prev, "prev_rating"].astype(int).to_numpy(),
+                test_df.loc[has_prev, "rating"].astype(int).to_numpy(),
+            )
+        )
+        pred_vals = np.array(
+            [float(pair_median.get(k, global_med)) for k in keys], dtype=float
+        )
+        pred[has_prev] = pred_vals
+    return pred
 
 
 def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
@@ -849,6 +888,10 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
     save_tmp: list[pd.DataFrame] = []
     last_algorithm_weights: Optional[list] = None
 
+    # grade_median_4_4 always excludes first reviews from metrics,
+    # regardless of the with_first_reviews flag.
+    method_always_excludes_first = config.method == "grade_median_4_4"
+
     for _, (train_idx, test_idx) in enumerate(tscv.split(eval_df)):
         if not config.train_equals_test:
             train_eval = eval_df.iloc[train_idx].copy()
@@ -881,6 +924,9 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
 
         elif config.method == "grade_median_4":
             pred = _predict_grade_median_4(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
+
+        elif config.method == "grade_median_4_4":
+            pred = _predict_grade_median_4_4(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
 
         elif config.method == "grade_median_8":
             pred = _predict_grade_median_8(train_eval, test_eval, with_first_reviews=config.with_first_reviews)
@@ -926,9 +972,18 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         out_df = test_eval.copy()
         out_df["t_true"] = out_df["duration_sec"].astype(float)
         out_df["t_pred"] = pred.astype(float)
-        out_df["used_for_metrics"] = True if config.with_first_reviews else ~out_df["first_review"]
 
-        metric_df = out_df if config.with_first_reviews else out_df[~out_df["first_review"]].copy()
+        # Determine which rows count for metrics
+        if method_always_excludes_first:
+            out_df["used_for_metrics"] = ~out_df["first_review"]
+            metric_df = out_df[~out_df["first_review"]].copy()
+        elif config.with_first_reviews:
+            out_df["used_for_metrics"] = True
+            metric_df = out_df.copy()
+        else:
+            out_df["used_for_metrics"] = ~out_df["first_review"]
+            metric_df = out_df[~out_df["first_review"]].copy()
+
         if len(metric_df) > 0:
             y_all.extend(metric_df["t_true"].tolist())
             p_all.extend(metric_df["t_pred"].tolist())
@@ -961,6 +1016,7 @@ def _parse_args() -> argparse.Namespace:
             "const",
             "user_median",
             "grade_median_4",
+            "grade_median_4_4",
             "grade_median_8",
             "fsrs_r_linear",
             "fsrs_r_grade_interact",
