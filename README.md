@@ -153,25 +153,24 @@ Checkpoint note:
 
 Calibration plots:
 
-- Build per-method calibration plots from `evaluate.py` text output:
+- Build per-method calibration plots directly from `result/*.jsonl`:
 
 ```bash
-python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
+python3 calibration_plots.py --result-dir ./result --out-dir calibration_plots --grid
 ```
 
 - Methods in calibration plots are ordered by ascending MAE and titles indicate MAE rank/value.
-
-- Regenerate graphs from latest `result/*.jsonl`:
-
-```bash
-python3 evaluate.py --result-dir ./result > results.txt
-python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
-```
 
 - Optional clean rebuild (remove old images first):
 
 ```bash
 rm -rf calibration_plots
+python3 calibration_plots.py --result-dir ./result --out-dir calibration_plots --grid
+```
+
+- Legacy mode (from `evaluate.py` text export):
+
+```bash
 python3 evaluate.py --result-dir ./result > results.txt
 python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
 ```
