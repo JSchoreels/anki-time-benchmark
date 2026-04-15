@@ -45,6 +45,7 @@ from tqdm.auto import tqdm  # type: ignore
 
 from fsrs_optimizer import BatchDataset, BatchLoader, DevicePrefetchLoader  # type: ignore
 from fsrs_v7 import FSRS7
+from moving_avg import moving_avg_seconds
 from data import create_features
 from review_time_nn import (
     ReviewTimeNN,
@@ -73,6 +74,7 @@ METHOD_NAMES = {
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
     "poor_mans_fsrs": "POOR_MANS_FSRS",
+    "moving_avg": "MOVING_AVG",
 }
 
 
@@ -89,6 +91,12 @@ class Config:
     seed: int = 42
     default_params: bool = False
     use_recency_weighting: bool = False
+
+    # For MOVING-AVG
+    moving_avg_alpha: float = 0.3
+    moving_avg_init_value: Optional[float] = None
+    moving_avg_log_space: bool = True
+    moving_avg_min_seconds: float = 0.05
 
     include_short_term: bool = True
     two_buttons: bool = False
@@ -147,6 +155,10 @@ def build_config(args: argparse.Namespace) -> Config:
         nn_finetune_epochs=args.nn_finetune_epochs,
         nn_finetune_lr=args.nn_finetune_lr,
         nn_finetune_batch_size=args.nn_finetune_batch_size,
+        moving_avg_alpha=args.moving_avg_alpha,
+        moving_avg_init_value=args.moving_avg_init_value,
+        moving_avg_log_space=(not args.moving_avg_linear_space),
+        moving_avg_min_seconds=args.moving_avg_min_seconds,
     )
 
 
@@ -436,7 +448,11 @@ def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_
     return test_df["rating"].map(med).astype(float).to_numpy()
 
 
-def _predict_grade_median_4_4(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np.ndarray:
+def _predict_grade_median_4_4(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    with_first_reviews: bool = False,  # kept for call compatibility; intentionally unused
+) -> np.ndarray:
     """Predict by (prev_rating, current_rating) pair — 16 bins.
 
     Training scope: rows that have a prev_rating (i.e. not first reviews).
@@ -994,7 +1010,13 @@ def save_evaluation_file(user_id: int, df: pd.DataFrame, config: Config) -> None
 
 
 def sort_jsonl(file: Path) -> list:
-    data = [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines()]
+    if not file.exists():
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("", encoding="utf-8")
+        return []
+
+    lines = [line for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    data = [json.loads(line) for line in lines]
     data.sort(key=lambda x: x["user"])
     with file.open("w", encoding="utf-8", newline="\n") as f:
         for item in data:
@@ -1020,6 +1042,42 @@ def _catch(func):
 @_catch
 def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tuple[dict, Optional[dict]]:
     eval_df, algorithm_df = load_user_frames(user_id, config)
+
+    if config.method == "moving_avg":
+        _, _, save_df = moving_avg_seconds(
+            dataset=eval_df,
+            n_splits=config.n_splits,
+            target_col="duration_sec",
+            alpha=config.moving_avg_alpha,
+            init_value=config.moving_avg_init_value,
+            log_space=config.moving_avg_log_space,
+            min_seconds=config.moving_avg_min_seconds,
+        )
+
+        save_df = save_df.copy()
+        save_df["t_true"] = pd.to_numeric(save_df["duration_sec"], errors="coerce")
+        save_df["t_pred"] = pd.to_numeric(save_df["t_pred"], errors="coerce")
+        save_df = save_df.dropna(subset=["t_true", "t_pred"]).copy()
+
+        if not config.with_first_reviews and "first_review" in save_df.columns:
+            save_df["used_for_metrics"] = ~save_df["first_review"]
+            metric_df = save_df[~save_df["first_review"]].copy()
+        else:
+            save_df["used_for_metrics"] = True
+            metric_df = save_df.copy()
+
+        if len(metric_df) == 0:
+            raise Exception(f"{user_id}: no evaluation rows for moving_avg after filtering.")
+
+        save_evaluation_file(user_id, save_df, config)
+        return evaluate(
+            metric_df["t_true"].astype(float).tolist(),
+            metric_df["t_pred"].astype(float).tolist(),
+            user_id,
+            config,
+            None,
+        )
+
     if not config.with_first_reviews and (~eval_df["first_review"]).sum() == 0:
         raise Exception(f"{user_id}: only first reviews; skipping user.")
 
@@ -1160,11 +1218,17 @@ def _parse_args() -> argparse.Namespace:
             "grade_median_4_4",
             "grade_median_8",
             "poor_mans_fsrs",
+            "moving_avg",
             "fsrs_r_linear",
             "fsrs_r_grade_interact",
             "fsrs_dsr_grade_nn",
         ],
     )
+
+    p.add_argument("--moving_avg_alpha", type=float, default=0.3)
+    p.add_argument("--moving_avg_init_value", type=float, default=None)
+    p.add_argument("--moving_avg_linear_space", action="store_true")
+    p.add_argument("--moving_avg_min_seconds", type=float, default=0.05)
 
     p.add_argument("--batch-size", dest="batch_size", type=int, default=512)
     p.add_argument("--n-splits", dest="n_splits", type=int, default=5)
@@ -1206,6 +1270,12 @@ def main() -> None:
 
     result_file = Path(f"result/{file_name}.jsonl")
     raw_file = Path(f"raw/{file_name}.jsonl")
+
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    result_file.touch(exist_ok=True)
+    if config.save_raw_output:
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_file.touch(exist_ok=True)
 
     processed_users: set[int] = set()
     if result_file.exists():
