@@ -16,6 +16,7 @@ Methods:
 - fsrs_one_minus_r_s_reps_d_ridge
 - fsrs_dsr_grade_nn
 - poor_mans_fsrs
+- moving_avg
 
 Behavior for fsrs_dsr_grade_nn:
 1) Pretrain once and save .pth checkpoint if it does not exist.
@@ -1549,19 +1550,60 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         )
 
         save_df = save_df.copy()
+
+        # Ensure event_id + first_review are aligned with eval_df (robustness across moving_avg impl details)
+        if "event_id" not in save_df.columns:
+            raise Exception(f"{user_id}: moving_avg output is missing event_id; cannot align split filtering.")
+
+        save_df["event_id"] = pd.to_numeric(save_df["event_id"], errors="coerce")
+        save_df = save_df.dropna(subset=["event_id"]).copy()
+        save_df["event_id"] = save_df["event_id"].astype(int)
+
+        if "first_review" not in save_df.columns or save_df["first_review"].isna().any():
+            first_map = dict(zip(eval_df["event_id"].astype(int).tolist(), eval_df["first_review"].tolist()))
+            save_df["first_review"] = save_df["event_id"].map(first_map)
+
+        # Match split-validity logic used by all other methods
+        valid_test_event_ids: set[int] = set()
+        tscv = TimeSeriesSplit(n_splits=config.n_splits)
+
+        for train_idx, test_idx in tscv.split(eval_df):
+            if not config.train_equals_test:
+                train_eval = eval_df.iloc[train_idx].copy()
+                test_eval = eval_df.iloc[test_idx].copy()
+            else:
+                train_eval = eval_df.copy()
+                test_eval = eval_df.iloc[test_idx].copy()
+
+            if len(train_eval) == 0 or len(test_eval) == 0:
+                continue
+
+            if not config.with_first_reviews and (~train_eval["first_review"]).sum() == 0:
+                continue
+
+            valid_test_event_ids.update(test_eval["event_id"].astype(int).tolist())
+
+            if config.train_equals_test:
+                break
+
+        if len(valid_test_event_ids) == 0:
+            raise Exception(f"{user_id}: no valid splits after filtering.")
+
+        save_df = save_df[save_df["event_id"].isin(valid_test_event_ids)].copy()
+
         save_df["t_true"] = pd.to_numeric(save_df["duration_sec"], errors="coerce")
         save_df["t_pred"] = pd.to_numeric(save_df["t_pred"], errors="coerce")
         save_df = save_df.dropna(subset=["t_true", "t_pred"]).copy()
 
-        if not config.with_first_reviews and "first_review" in save_df.columns:
-            save_df["used_for_metrics"] = ~save_df["first_review"]
-            metric_df = save_df[~save_df["first_review"]].copy()
+        if not config.with_first_reviews:
+            save_df["used_for_metrics"] = ~save_df["first_review"].astype(bool)
+            metric_df = save_df[~save_df["first_review"].astype(bool)].copy()
         else:
             save_df["used_for_metrics"] = True
             metric_df = save_df.copy()
 
         if len(metric_df) == 0:
-            raise Exception(f"{user_id}: no evaluation rows for moving_avg after filtering.")
+            raise Exception(f"{user_id}: no evaluation rows after filtering by with_first_reviews={config.with_first_reviews}.")
 
         # Build a reference R-map so moving_avg can also report R-bucket precision.
         _, test_R_map, _ = _predict_R_maps(
