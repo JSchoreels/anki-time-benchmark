@@ -539,7 +539,14 @@ def print_table_for_suffix(
             )
         )
 
-    rows.sort(key=lambda x: x[1])
+    rows.sort(
+        key=lambda x: (
+            float("inf") if x[2] is None else float(x[2]),  # MAE asc
+            x[1],  # RMSE tie-breaker
+            float("inf") if x[3] is None else float(x[3]),  # MAPE tie-breaker
+            x[0],  # method name tie-breaker
+        )
+    )
 
     table_rows = [[method, rmse, mae, mape] for method, _, _, _, rmse, mae, mape in rows]
     _print_aligned_markdown_table(["Method", "RMSE", "MAE", "MAPE"], table_rows)

@@ -60,6 +60,12 @@ Run all methods in one command:
 python3 script.py --data ../anki-revlogs-10k --all-methods --processes 1
 ```
 
+Run linear methods with MAE fitting instead of MSE:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --method fsrs_r_linear --linear-loss mae
+```
+
 FSRS optimization cache (enabled by default):
 
 ```bash
@@ -125,6 +131,10 @@ Ridge option:
 
 - `--ridge-alpha <float>`: regularization strength for Ridge methods (`fsrs_r_ridge`, `fsrs_one_minus_r_s_reps_d_ridge`)
 
+Linear fit option:
+
+- `--linear-loss <mse|mae>`: fitting loss for linear variants (`fsrs_r_linear`, `fsrs_r_linear_by_grades`, `fsrs_r_grade_interact`, `fsrs_one_minus_r_s_reps_d_linear`, `fsrs_one_minus_r_s_reps_d_linear_by_grade`). Default: `mae`.
+
 NN options (`fsrs_dsr_grade_nn`):
 
 - `--nn_ckpt <path>`
@@ -140,6 +150,33 @@ NN options (`fsrs_dsr_grade_nn`):
 Checkpoint note:
 
 - Existing `checkpoints/review_time_pretrained.pth` files are loaded with full checkpoint deserialization (needed for stored normalizer arrays).
+
+Calibration plots:
+
+- Build per-method calibration plots from `evaluate.py` text output:
+
+```bash
+python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
+```
+
+- Methods in calibration plots are ordered by ascending MAE and titles indicate MAE rank/value.
+
+- Regenerate graphs from latest `result/*.jsonl`:
+
+```bash
+python3 evaluate.py --result-dir ./result > results.txt
+python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
+```
+
+- Optional clean rebuild (remove old images first):
+
+```bash
+rm -rf calibration_plots
+python3 evaluate.py --result-dir ./result > results.txt
+python3 calibration_plots.py --input results.txt --out-dir calibration_plots --grid
+```
+
+- See detailed usage in [`docs/CALIBRATION_PLOTS.MD`](docs/CALIBRATION_PLOTS.MD).
 
 
 ## Result

@@ -62,9 +62,10 @@ from review_time_nn import (
 )
 
 try:
-    from scipy.optimize import curve_fit  # type: ignore
+    from scipy.optimize import curve_fit, minimize  # type: ignore
 except Exception:
     curve_fit = None
+    minimize = None
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -114,6 +115,7 @@ class Config:
     moving_avg_log_space: bool = True
     moving_avg_min_seconds: float = 0.05
     ridge_alpha: float = 1.0
+    linear_loss: str = "mae"
 
     include_short_term: bool = True
     two_buttons: bool = False
@@ -180,6 +182,7 @@ def build_config(args: argparse.Namespace) -> Config:
         moving_avg_log_space=(not args.moving_avg_linear_space),
         moving_avg_min_seconds=args.moving_avg_min_seconds,
         ridge_alpha=args.ridge_alpha,
+        linear_loss=args.linear_loss,
         cache_fsrs_weights=(not args.no_cache_fsrs_weights),
         fsrs_weights_cache_dir=Path(args.fsrs_weights_cache_dir),
     )
@@ -536,6 +539,36 @@ def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     return coef
 
 
+def _fit_linear(X: np.ndarray, y: np.ndarray, loss: str) -> np.ndarray:
+    if loss == "mse":
+        return _fit_ols(X, y)
+
+    if loss != "mae":
+        raise ValueError(f"Unknown linear fit loss: {loss}")
+
+    init = _fit_ols(X, y)
+    if minimize is None:
+        return init
+
+    def objective(coef: np.ndarray) -> float:
+        pred = X @ coef
+        return float(np.mean(np.abs(pred - y)))
+
+    try:
+        result = minimize(
+            objective,
+            x0=init,
+            method="Powell",
+            options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 400},
+        )
+    except Exception:
+        return init
+
+    if not getattr(result, "success", False) or result.x.shape != init.shape:
+        return init
+    return np.asarray(result.x, dtype=float)
+
+
 def _poor_mans_fsrs_model(
     xdata: np.ndarray,
     a0: float,
@@ -779,6 +812,7 @@ def _predict_fsrs_r_linear(
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
     return_coefficients: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
@@ -795,7 +829,7 @@ def _predict_fsrs_r_linear(
     if len(fit_df) >= 2:
         X = np.column_stack([fit_df["R"].to_numpy(), np.ones(len(fit_df))])
         y = fit_df["duration_sec"].to_numpy()
-        a, b = _fit_ols(X, y)
+        a, b = _fit_linear(X, y, loss=linear_loss)
     else:
         a, b = 0.0, global_med
 
@@ -871,6 +905,7 @@ def _predict_fsrs_r_linear_by_grades(
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
     return_coefficients: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
@@ -894,7 +929,7 @@ def _predict_fsrs_r_linear_by_grades(
         if len(gdf) >= 2:
             X = np.column_stack([gdf["R"].to_numpy(dtype=float), np.ones(len(gdf))])
             y = gdf["duration_sec"].to_numpy(dtype=float)
-            a, b = _fit_ols(X, y)
+            a, b = _fit_linear(X, y, loss=linear_loss)
         else:
             a, b = 0.0, non_first_map[g]
         coeffs_by_grade[g] = (float(a), float(b))
@@ -930,6 +965,7 @@ def _predict_fsrs_r_grade_interact(
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
 ) -> np.ndarray:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
     global_med = float(scope_df["duration_sec"].median())
@@ -947,7 +983,7 @@ def _predict_fsrs_r_grade_interact(
         R = fit_df["R"].to_numpy().astype(float)
         X = np.column_stack([np.ones(len(fit_df)), g, R, g * R])
         y = fit_df["duration_sec"].to_numpy()
-        a0, a1, a2, a3 = _fit_ols(X, y)
+        a0, a1, a2, a3 = _fit_linear(X, y, loss=linear_loss)
     else:
         a0, a1, a2, a3 = global_med, 0.0, 0.0, 0.0
 
@@ -975,6 +1011,7 @@ def _predict_fsrs_one_minus_r_s_reps_d_linear(
     train_dsr_map: dict[int, tuple[float, float, float]],
     test_dsr_map: dict[int, tuple[float, float, float]],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
     return_coefficients: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
@@ -995,7 +1032,7 @@ def _predict_fsrs_one_minus_r_s_reps_d_linear(
         reps = pd.to_numeric(fit_df["total_reps_before"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
         y = fit_df["duration_sec"].to_numpy(dtype=float)
         X = np.column_stack([np.ones(len(fit_df)), 1.0 - R, S, reps, D])
-        a, b, c, d, e = _fit_ols(X, y)
+        a, b, c, d, e = _fit_linear(X, y, loss=linear_loss)
     else:
         a, b, c, d, e = global_med, 0.0, 0.0, 0.0, 0.0
 
@@ -1096,6 +1133,7 @@ def _predict_fsrs_one_minus_r_s_reps_d_linear_by_grade(
     train_dsr_map: dict[int, tuple[float, float, float]],
     test_dsr_map: dict[int, tuple[float, float, float]],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
     return_coefficients: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
@@ -1123,7 +1161,7 @@ def _predict_fsrs_one_minus_r_s_reps_d_linear_by_grade(
             reps = pd.to_numeric(gdf["total_reps_before"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
             y = gdf["duration_sec"].to_numpy(dtype=float)
             X = np.column_stack([np.ones(len(gdf)), 1.0 - R, S, reps, D])
-            a, b, c, d, e = _fit_ols(X, y)
+            a, b, c, d, e = _fit_linear(X, y, loss=linear_loss)
         else:
             a, b, c, d, e = non_first_map[g], 0.0, 0.0, 0.0, 0.0
         coeffs_by_grade[g] = (float(a), float(b), float(c), float(d), float(e))
@@ -1624,6 +1662,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_R_map,
                     test_R_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                     return_coefficients=config.save_weights,
                 )
                 if config.save_weights:
@@ -1638,6 +1677,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_R_map,
                     test_R_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                     return_coefficients=config.save_weights,
                 )
                 if config.save_weights:
@@ -1667,6 +1707,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_R_map,
                     test_R_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                 )
 
         elif config.method in (
@@ -1688,6 +1729,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_dsr_map=train_dsr_map,
                     test_dsr_map=test_dsr_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                     return_coefficients=config.save_weights,
                 )
             elif config.method == "fsrs_one_minus_r_s_reps_d_linear_by_grade":
@@ -1697,6 +1739,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_dsr_map=train_dsr_map,
                     test_dsr_map=test_dsr_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                     return_coefficients=config.save_weights,
                 )
             else:
@@ -1822,6 +1865,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--moving_avg_init_value", type=float, default=None)
     p.add_argument("--moving_avg_linear_space", action="store_true")
     p.add_argument("--moving_avg_min_seconds", type=float, default=0.05)
+    p.add_argument("--linear-loss", dest="linear_loss", choices=["mse", "mae"], default="mae")
     p.add_argument("--ridge-alpha", dest="ridge_alpha", type=float, default=1.0)
 
     p.add_argument("--batch-size", dest="batch_size", type=int, default=512)
